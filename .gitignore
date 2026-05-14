@@ -1,0 +1,30 @@
+# Logs (training data + simulations)
+logs/
+bots/data/*.jsonl
+
+# ML model weights
+bots/models/*.pt
+bots/models/*.pkl
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# System files
+.DS_Store
+
+# Virtual environments
+venv/
+.env/
+.env/*
+
+# Generated tournament charts
+tournament_progress.png
+.venv/
+models/*.pkl
+models/*.pt
