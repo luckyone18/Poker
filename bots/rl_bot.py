@@ -10,6 +10,9 @@ from collections import deque
 from core.bot_api import Action, PlayerView
 from core.engine import eval_hand, EVAL_HAND_MAX
 
+# Debug counter for act() tracing
+_debug_act_count = [0]
+
 # Card encoding (same as MLBot)
 RANKS = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8,
          "9":9, "T":10, "J":11, "Q":12, "K":13, "A":14}
@@ -68,16 +71,16 @@ class RLBot:
     """
     
     def __init__(self, model_path="models/rl_model.pt", device="cpu",
-                 learning_rate=1e-4, training_mode=False, exploration_rate=0.1,
-                 use_fallback=True, starting_chips=500):
+                 learning_rate=1e-4, training_mode=False, exploration_rate=0.05,
+                 use_fallback=True, starting_chips=500, hidden_size=256, batch_size=8):
         self.device = device
         self.training_mode = training_mode
         self.exploration_rate = exploration_rate
         self.use_fallback = use_fallback
-        self.starting_chips = max(1, starting_chips)  # used to normalise stack/pot features
-        self.model_loaded = False  # Track if model loaded successfully
-        self.policy_net = PolicyNetwork(input_dim=26, hidden=512).to(device)
-        self.value_net  = ValueNetwork(input_dim=26,  hidden=512).to(device)
+        self.starting_chips = max(1, starting_chips)
+        self.model_loaded = False
+        self.policy_net = PolicyNetwork(input_dim=26, hidden=hidden_size).to(device)
+        self.value_net  = ValueNetwork(input_dim=26,  hidden=hidden_size).to(device)
         self.optimizer       = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.value_optimizer = optim.Adam(self.value_net.parameters(),  lr=learning_rate)
 
@@ -88,7 +91,7 @@ class RLBot:
 
         # Batch buffer: collect multiple episodes before each update
         self.episode_buffer = []
-        self.batch_size     = 32
+        self.batch_size     = batch_size
 
         # Load existing model if available
         try:
@@ -143,7 +146,10 @@ class RLBot:
         pot = float(state.pot) / scale
         to_call = float(state.to_call) / scale
         hero_stack = float(state.stacks.get(state.me, 0)) / scale
-        eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
+        if state.opponents:
+            eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
+        else:
+            eff_stack = hero_stack
         n_players = len(state.opponents) + 1
         
         # Hole cards encoding
@@ -289,84 +295,85 @@ class RLBot:
                 amt = max(a["min"], min(a["max"], pot * 0.5))
                 return Action("bet", round(amt, 2))
         return self._choose("check", legal)
-    
+
     def act(self, state):
         """Choose action using policy network."""
+        import torch.nn.functional as F
+
+        _debug_act_count[0] += 1
+        _cnt = _debug_act_count[0]
+
         try:
-            # Handle dict/PlayerView
+            # Convert dict to object so _make_features can use dot-notation
             if isinstance(state, dict):
                 class DictView:
                     def __init__(self, d):
                         for k, v in d.items():
                             setattr(self, k, v)
                 state = DictView(state)
-            
+
             legal = state.legal_actions
-            
-            # Update memory
             if hasattr(state, 'history') and state.history:
                 self._update_memory(state.history, state.opponents)
-            
-            # Use fallback if model not loaded and fallback enabled
+
+            # Use fallback if model not loaded AND not in training mode
             if not self.model_loaded and self.use_fallback and not self.training_mode:
                 return self._fallback_strategy(state)
-            
-            # Get features
-            features = self._make_features(state)
-            
-            # Get action probabilities
-            if self.training_mode:
-                # Training mode: need gradients for the PPO update
-                logits = self.policy_net(features)
-                probs  = torch.softmax(logits, dim=1)
-                value  = self.value_net(features)   # shape: (1,)
-            else:
-                # Eval mode: no gradients needed
-                with torch.no_grad():
-                    logits = self.policy_net(features)
-                    probs  = torch.softmax(logits, dim=1)
 
-            # Epsilon-greedy exploration during training
+            # Extract features (26-dim vector) - returns FloatTensor on CPU
+            features = self._make_features(state)
+            feat_dev = features.to(self.device)
+
+            # Policy + value forward pass
+            if self.training_mode:
+                logits = self.policy_net(feat_dev)
+                probs  = F.softmax(logits, dim=-1).clamp(min=1e-8)
+                value  = self.value_net(feat_dev.detach()).squeeze(-1)
+            else:
+                with torch.no_grad():
+                    logits = self.policy_net(feat_dev)
+                    probs  = F.softmax(logits, dim=-1).clamp(min=1e-8)
+                    value  = torch.zeros(1, device=self.device)
+
+            # Epsilon-greedy
             if self.training_mode and random.random() < self.exploration_rate:
-                # Explore: random action — still track log_prob for PPO ratio
-                random_action = random.randint(0, 5)
-                action_idx = torch.tensor([random_action], device=self.device)
+                action_idx = torch.tensor([random.randint(0, 5)], device=self.device)
                 dist = torch.distributions.Categorical(probs)
                 log_prob = dist.log_prob(action_idx)
+                chosen_act = "EXPLORE"
             elif self.training_mode:
-                # Exploit: sample from policy
                 dist = torch.distributions.Categorical(probs)
                 action_idx = dist.sample()
                 log_prob = dist.log_prob(action_idx)
+                chosen_act = "EXPLOIT"
             else:
-                # Eval mode: greedy
                 action_idx = probs.argmax(dim=1)
                 log_prob = torch.log(probs[0, action_idx] + 1e-8)
+                chosen_act = "GREEDY"
 
-            # Store trajectory step for PPO update
+            # Record trajectory step
             if self.training_mode:
                 self.current_episode.append({
-                    'state':    features,
+                    'state':    feat_dev,
                     'action':   action_idx.item(),
-                    'log_prob': log_prob.detach(),   # old π(a|s) — frozen
-                    'value':    value.detach(),       # V(s) old estimate — frozen
+                    'log_prob': log_prob.detach(),
+                    'value':    value.detach(),
                     'legal_actions': legal,
                 })
-            
-            # Convert to actual action
+                if _cnt <= 5:
+                    probs_list = probs[0].detach().cpu().tolist()
+                    print(f"  [RECORDED] ep_len={len(self.current_episode)} probs={[round(p,3) for p in probs_list]} chosen={action_idx.item()} ({chosen_act})", flush=True)
+
             return self._action_idx_to_action(action_idx.item(), legal)
-        
+
         except Exception as e:
-            # If anything goes wrong, use fallback
+            import traceback
+            tb = traceback.format_exc()
+            print(f"[ERROR] RLBot.act() exception: {e}\n{tb[-500:]}", flush=True)
             if self.use_fallback:
-                try:
-                    return self._fallback_strategy(state)
-                except:
-                    # Last resort: just fold
-                    legal = state.legal_actions if hasattr(state, 'legal_actions') else []
-                    return self._choose("fold", legal)
-            else:
-                raise
+                legal = getattr(state, 'legal_actions', []) if 'state' in dir() else []
+                return self._choose("fold", legal)
+            raise
     
     def _action_idx_to_action(self, idx, legal):
         """Convert action index to Action object."""
@@ -476,7 +483,7 @@ class RLBot:
             episodes: list of episode buffers, each a list of step dicts
                       with keys: state, action, log_prob, value, reward
         """
-        GAMMA     = 0.99
+        GAMMA     = 0.95
         LAMBDA    = 0.95
         CLIP_EPS  = 0.2
         VF_COEF   = 0.5

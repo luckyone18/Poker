@@ -4,9 +4,9 @@ Train the RL bot through a three-stage curriculum:
 
 Curriculum rules
 ----------------
-* Promotion thresholds (rolling window = 1 000 episodes):
-    - random   → heuristic : 60 % WR
-    - heuristic → self-play : 55 % WR
+# Promotion thresholds (rolling window = 1 000 episodes):
+#     - random   → heuristic : 55 % WR  (was 60%, lowered: RL rarely reaches 60% vs random in 5k eps)
+#     - heuristic → self-play : 48 % WR  (was 55%, lowered: 50% means break-even vs heuristic is good enough to enter self-play)
 * No demotion: once promoted, the bot stays at the new stage.
 * Self-play snapshots are saved every 500 episodes to
     models/rl_selfplay_snapshot.pt
@@ -73,13 +73,14 @@ SNAPSHOT_EVERY   = 500     # save a new snapshot every N episodes in self-play
 START_CHECKPOINT = "models/rl_model_run2.pt"
 FINAL_MODEL_PATH = "models/rl_model_run3.pt"
 DEFAULT_CSV_PATH = "output/rl_training_log_selfplay.csv"
-HIDDEN_SIZE      = 512
+HIDDEN_SIZE      = 256
 
 
 # ── Main training function ───────────────────────────────────────────────────
 
 def train_rl_bot(num_episodes=10_000, chips_per_player=500,
-                 csv_path=None, lr_step_episodes=30_000):
+                 csv_path=None, lr_step_episodes=50_000,
+                 hand_collector=None):
     """
     Train RL bot through the three-stage curriculum (no demotion).
 
@@ -88,6 +89,7 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
         chips_per_player: Starting chips per player.
         csv_path:        Optional path to write per-episode CSV log.
         lr_step_episodes: Reduce LR by 0.5× every this many episodes.
+        hand_collector:  Optional HandHistoryCollector for logging hands.
     """
     print("=" * 70)
     print("TRAINING RL BOT  (selfplay curriculum)")

@@ -222,6 +222,9 @@ class SmartBot:
             else:
                 full_board = list(board)
             my_score = eval_hand(hole, full_board)
+            if not opp_hands:
+                wins += 1          # no valid opponent hands → count as win
+                continue
             best_opp = max(eval_hand(opp, full_board) for opp in opp_hands)
             if my_score > best_opp:
                 wins += 1

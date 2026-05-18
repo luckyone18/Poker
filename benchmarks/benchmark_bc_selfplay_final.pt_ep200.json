@@ -1,0 +1,24 @@
+{
+  "RandomBot": {
+    "win_rate": 68.5,
+    "avg_final_chips": 2740.0,
+    "avg_hands_per_game": 23.9,
+    "total_episodes": 200,
+    "total_time_s": 5.4,
+    "chip_distribution": {
+      "0": 63,
+      "4000": 137
+    }
+  },
+  "SmartBot": {
+    "win_rate": 1.5,
+    "avg_final_chips": 60.0,
+    "avg_hands_per_game": 120.5,
+    "total_episodes": 200,
+    "total_time_s": 235.6,
+    "chip_distribution": {
+      "0": 197,
+      "4000": 3
+    }
+  }
+}

@@ -1,3 +1,1 @@
-torch>=1.9.0
-matplotlib>=3.5.0
-treys>=0.1.8
+torch
