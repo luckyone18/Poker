@@ -5,8 +5,8 @@ Usage (after `modal token set`):
     # Test imports (free, CPU-only)
     modal run modal_train.py::quick_test
 
-    # Run training (5k episodes = ~2h on T4, good first test)
-    modal run modal_train.py --episodes 5000
+    # Run training (10k episodes = ~4h on T4)
+    modal run modal_train.py --episodes 10000 --resume models/bc_smartbot_final.pt
 
     # Resume from checkpoint
     modal run modal_train.py --episodes 5000 --resume models/rl_model_omc.pt

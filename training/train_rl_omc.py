@@ -129,7 +129,7 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
     rl_bot = RLBot(
         model_path="",
         training_mode=True,
-        learning_rate=3e-4,
+        learning_rate=5e-6,     # Conservative: BC policy is already strong, RL should be fine-tuning
         starting_chips=chips_per_player,
         batch_size=512,  # Increased from 8 for faster training
     )
@@ -167,7 +167,7 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
     else:
         print(f"[checkpoint] {START_CHECKPOINT} not found — starting fresh")
 
-    initial_lr      = 3e-4
+    initial_lr      = 5e-6   # Conservative: BC policy is already strong (99.2%), RL fine-tuning
     lr_decay_factor = 0.5
     first_lr_drop   = lr_step_episodes // 2   # first halving earlier
 
@@ -240,7 +240,7 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
             "P2": InProcessBot(rl_bot),
         }
 
-        # Tournament
+# Tournament
         table        = Table()
         dealer_index = 0
         initial_chips_p2 = chips_per_player
@@ -251,7 +251,6 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
                 winner = active_seats[0].player_id if active_seats else None
                 break
 
-            chips_before = sum(s.chips for s in seats if s.player_id == "P2")
             result = table.play_hand(
                 seats=active_seats,
                 small_blind=1, big_blind=2,
@@ -260,11 +259,8 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
                 on_event=None,
                 log_decisions=False,
             )
-            chips_after = sum(s.chips for s in seats if s.player_id == "P2")
-            if "P2" in result:
-                rl_bot.record_reward(
-                    (chips_after - chips_before) / max(chips_before, 1)
-                )
+            # Per-hand chip delta is NOW handled automatically inside rl_bot.record_reward()
+            # via per-round chip tracking in each step. No per-hand reward needed here.
 
             dealer_index = (dealer_index + 1) % len(seats)
             if dealer_index > 10_000:

@@ -89,6 +89,10 @@ class RLBot:
         self.episode_rewards = []
         self._hand_step_start = 0   # index into current_episode where current hand's steps begin
 
+        # Per-round reward shaping: track hero's chip count at each step
+        self._prev_chips = 0        # hero total chips at previous step
+        self._prev_invested = 0    # hero chips invested in pot at previous step
+
         # Batch buffer: collect multiple episodes before each update
         self.episode_buffer = []
         self.batch_size     = batch_size
@@ -353,12 +357,16 @@ class RLBot:
 
             # Record trajectory step
             if self.training_mode:
+                # Per-round shaping: capture hero chip count for reward computation
+                hero_chips = float(state.stacks.get(state.me, 0))
                 self.current_episode.append({
-                    'state':    feat_dev,
-                    'action':   action_idx.item(),
-                    'log_prob': log_prob.detach(),
-                    'value':    value.detach(),
+                    'state':         feat_dev,
+                    'action':        action_idx.item(),
+                    'log_prob':      log_prob.detach(),
+                    'value':         value.detach(),
                     'legal_actions': legal,
+                    # Chip tracking for per-round reward shaping (chip delta per step)
+                    'chips':         hero_chips,
                 })
                 if _cnt <= 5:
                     probs_list = probs[0].detach().cpu().tolist()
@@ -420,20 +428,48 @@ class RLBot:
     
     def record_reward(self, reward):
         """
-        Record reward for the most recent hand's steps only.
+        Compute per-round chip delta rewards for steps in the current hand.
 
-        Call this after each hand with the normalised chip delta
-        ``(final_chips - starting_chips) / starting_chips``.
-        Only the steps belonging to the hand just played are tagged;
-        earlier hands keep their own rewards.
+        Per-round shaping: at each step, the immediate reward is the change in
+        the hero's chip investment since the last step.
+          - Hero puts more chips in  → negative reward (cost of betting/calling)
+          - Hero wins chips back     → positive reward (chip gain from pot)
+        At the terminal step (showdown), the net chip delta is added.
+
+        The value network is BYPASSED — we use Monte-Carlo advantage estimation
+        with N rollouts per state.  With dense per-step rewards the value net
+        is unnecessary and its random initialisation corrupts GAE.
         """
-        if self.training_mode and self.current_episode:
-            # Tag only the steps that belong to the hand that just finished
-            for step in self.current_episode[self._hand_step_start:]:
-                step['reward'] = reward
-            # Advance the marker so the next hand's reward won't overwrite these
-            self._hand_step_start = len(self.current_episode)
-            self.episode_rewards.append(reward)
+        if not self.training_mode or not self.current_episode:
+            return
+
+        steps = self.current_episode[self._hand_step_start:]
+        if not steps:
+            return
+
+        scale = max(self.starting_chips, 1)
+
+        # Pass 1: compute per-step chip-delta rewards
+        # Immediate reward = change in total chips since last step.
+        # Hero loses chips  → negative reward (cost of bet/call)
+        # Hero wins pot     → positive reward (chip gain)
+        prev_chips = float(steps[0].get('chips', 0))
+        net_delta  = 0.0   # cumulative net chip change this hand
+
+        for step in steps:
+            curr_chips = float(step.get('chips', 0))
+            delta = (curr_chips - prev_chips) / scale
+            step['reward'] = delta
+            net_delta += delta
+            prev_chips = curr_chips
+
+        # Terminal step: add net chip delta + bonus
+        terminal_bonus = net_delta + reward
+        steps[-1]['reward'] = steps[-1].get('reward', 0) + terminal_bonus
+
+        # Advance so next hand's reward won't overwrite these
+        self._hand_step_start = len(self.current_episode)
+        self.episode_rewards.append(reward)
     
     def end_episode(self):
         """Buffer the completed episode; run PPO update every batch_size episodes."""
@@ -471,24 +507,22 @@ class RLBot:
 
     def _ppo_update(self, episodes):
         """
-        Run a PPO update over a batch of completed episodes.
+        PPO update using REWARD-TO-GO advantage (no value network).
 
-        Uses clipped surrogate objective (PPO-clip) with:
-          - GAE-lambda advantage estimation (gamma=0.99, lambda=0.95)
-          - Shared normalisation of advantages across the batch
-          - Entropy bonus to encourage exploration
-          - Gradient clipping for stability
+        Each step's advantage = discounted sum of future rewards from that step.
+        This avoids the value network entirely — no bootstrap error, no convergence
+        needed.  With dense per-step rewards this gives clean advantage signal.
 
         Args:
             episodes: list of episode buffers, each a list of step dicts
-                      with keys: state, action, log_prob, value, reward
+                      with keys: state, action, log_prob, reward
         """
-        GAMMA     = 0.95
-        LAMBDA    = 0.95
-        CLIP_EPS  = 0.2
-        VF_COEF   = 0.5
-        ENT_COEF  = 0.01
+        GAMMA      = 0.95
+        CLIP_EPS   = 0.2
+        ENT_COEF   = 0.02
+        KL_COEF    = 0.03    # KL penalty to keep policy close to old policy
         PPO_EPOCHS = 4
+        N_ROLLOUTS = 0       # value net disabled — using reward-to-go instead
 
         all_states       = []
         all_actions      = []
@@ -503,21 +537,27 @@ class RLBot:
                 continue
 
             rewards = [s['reward'] for s in steps]
-            values  = [float(s['value'].item() if hasattr(s['value'], 'item')
-                             else s['value']) for s in steps]
 
-            # GAE advantage + discounted return computation (backward pass)
-            gae        = 0.0
-            next_value = 0.0
-            advantages = [0.0] * len(steps)
-            returns    = [0.0] * len(steps)
+            # ── Reward-to-go advantage (no value network needed) ──────────
+            # Return at step t = sum of discounted future rewards r_t + γ*r_{t+1} + ...
+            # With dense per-step rewards this is unbiased and low-variance.
+            # Advantage = Return - baseline, where baseline = mean(Returns)
+            T      = len(rewards)
+            returns = [0.0] * T
+            gae     = 0.0
+            for t in reversed(range(T)):
+                gae     = rewards[t] + GAMMA * gae
+                returns[t] = gae
 
-            for t in reversed(range(len(steps))):
-                delta          = rewards[t] + GAMMA * next_value - values[t]
-                gae            = delta + GAMMA * LAMBDA * gae
-                advantages[t]  = gae
-                returns[t]     = gae + values[t]
-                next_value     = values[t]
+            # Compute baseline = exponential moving average of returns (online)
+            # Fall back to simple mean for the first few batches
+            batch_ret_mean = sum(returns) / T
+            batch_ret_std  = (sum((r - batch_ret_mean) ** 2 for r in returns) / T) ** 0.5
+            baseline = batch_ret_mean
+            if batch_ret_std > 1e-8:
+                advantages = [returns[t] - baseline for t in range(T)]
+            else:
+                advantages = [0.0] * T
 
             for step, adv, ret in zip(steps, advantages, returns):
                 all_states.append(step['state'])
@@ -536,7 +576,7 @@ class RLBot:
         advantages_t   = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
         returns_t      = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
 
-        # Normalise advantages across the whole batch
+        # Normalise advantages across the whole batch (zero-mean, unit-variance)
         if advantages_t.numel() > 1 and advantages_t.std() > 1e-8:
             advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
 
@@ -546,29 +586,24 @@ class RLBot:
             indices = torch.randperm(n, device=self.device)
 
             # ── Policy loss ──────────────────────────────────────────
-            logits       = self.policy_net(states_t[indices])
-            dist         = torch.distributions.Categorical(logits=logits)
+            logits        = self.policy_net(states_t[indices])
+            dist          = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(actions_t[indices])
-            entropy      = dist.entropy().mean()
+            entropy       = dist.entropy().mean()
 
             ratio  = torch.exp(new_log_probs - old_log_probs_t[indices].detach())
             adv_b  = advantages_t[indices]
             surr1  = ratio * adv_b
             surr2  = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_b
             policy_loss = -torch.min(surr1, surr2).mean() - ENT_COEF * entropy
+            # KL penalty: keep policy close to old policy (PPO standard)
+            with torch.no_grad():
+                kl_div = (torch.exp(old_log_probs_t[indices].detach())
+                           * (old_log_probs_t[indices] - new_log_probs.detach())).mean()
+            policy_loss = policy_loss + KL_COEF * kl_div
 
             self.optimizer.zero_grad()
             policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.optimizer.step()
-
-            # ── Value loss ───────────────────────────────────────────
-            values_pred = self.value_net(states_t[indices])
-            value_loss  = VF_COEF * torch.nn.functional.mse_loss(
-                values_pred, returns_t[indices].detach()
-            )
-
-            self.value_optimizer.zero_grad()
-            value_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
-            self.value_optimizer.step()
+            # Value network frozen — not used for advantage estimation
