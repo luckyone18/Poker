@@ -63,6 +63,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     print(f"Launching training: {args.episodes} episodes, resume={args.resume}")
+    # Clone the poker repo into the container
+    import subprocess
+    subprocess.run(
+        ["git", "clone", "https://github.com/luckyone18/Poker.git", "/root/poker"],
+        check=True, capture_output=True
+    )
     with app.run():
         Trainer().train.remote(args.episodes, args.resume)
         print("Done!")
