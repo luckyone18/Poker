@@ -10,6 +10,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch>=1.9.0", "matplotlib>=3.5.0", "treys>=0.1.8")
     .pip_install("numpy")
+    .apt_install("git")
 )
 
 volume = modal.Volume.from_name("poker-models", create_if_missing=True)
@@ -41,14 +42,17 @@ class Trainer:
         os.chdir("/root/poker")
 
         os.makedirs("/root/models", exist_ok=True)
-        # Symlink: /root/models -> /root/poker/models (volume)
-        # This makes relative paths like "models/rl_model.pt" resolve to the volume
+
+        # Symlink /root/poker/models → /root/models (volume)
+        # After git clone, /root/poker/models is an empty directory. Replace with symlink.
         poker_models_dir = "/root/poker/models"
-        if not os.path.islink(poker_models_dir) and not os.path.exists(poker_models_dir):
-            os.makedirs(os.path.dirname(poker_models_dir), exist_ok=True)
         if os.path.islink(poker_models_dir):
             os.remove(poker_models_dir)
-        if not os.path.exists(poker_models_dir):
+        elif os.path.isdir(poker_models_dir):
+            # Directory exists from git clone — remove it then symlink
+            import shutil
+            shutil.rmtree(poker_models_dir)
+        if not os.path.islink(poker_models_dir):
             os.symlink("/root/models", poker_models_dir)
         print(f"/root/poker/models symlink: {os.path.islink(poker_models_dir)}")
 
