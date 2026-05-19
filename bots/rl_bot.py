@@ -547,7 +547,6 @@ class RLBot:
         GAMMA        = 0.95
         CLIP_EPS     = 0.2
         ENT_COEF     = 0.01   # reduced entropy — BC provides enough exploration signal
-        OLD_KL_COEF  = 0.01   # within-batch PPO KL (small, just for update stability)
         BC_KL_COEF   = 0.80   # BC constraint — primary driver of conservative updates
         PPO_EPOCHS   = 4
 
@@ -594,7 +593,7 @@ class RLBot:
         # Stack into tensors
         states_t        = torch.cat(all_states, dim=0).to(self.device)
         actions_t       = torch.tensor(all_actions, dtype=torch.long).to(self.device)
-        old_log_probs_t = torch.stack(all_old_log_probs).to(self.device).squeeze()
+        old_log_probs_t = torch.stack(all_old_log_probs).squeeze(-1).to(self.device)
         advantages_t    = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
         returns_t       = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
 
@@ -611,9 +610,8 @@ class RLBot:
             # ── Policy logits ────────────────────────────────────────────
             logits         = self.policy_net(states_t[idx])
             dist           = torch.distributions.Categorical(logits=logits)
-            new_log_probs  = dist.log_prob(actions_t[idx])
+            new_log_probs  = dist.log_prob(actions_t[idx]).squeeze(-1)
             entropy        = dist.entropy().mean()
-            probs_current  = dist.probs                            # (B, A)
 
             # ── 1. PPO clipped surrogate (against old within-batch policy)
             ratio       = torch.exp(new_log_probs - old_log_probs_t[idx].detach())
@@ -640,7 +638,6 @@ class RLBot:
             total_loss = (
                 ppo_loss
                 - ENT_COEF * entropy
-                + OLD_KL_COEF * ppo_loss.detach()  # small stabiliser
                 + BC_KL_COEF * bc_kl_loss           # primary BC constraint
             )
 
