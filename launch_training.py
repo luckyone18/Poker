@@ -45,7 +45,7 @@ class Trainer:
         train_rl_bot(
             num_episodes=episodes,
             chips_per_player=500,
-            csv_path="/root/models/rl_omc_training_log.csv",
+            csv_path="/root/models/rl_run3_training_log.csv",
             lr_step_episodes=25000,
             resume_from=resume_path,
         )
