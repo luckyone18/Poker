@@ -15,10 +15,11 @@ image = (
 volume = modal.Volume.from_name("poker-models", create_if_missing=True)
 app = modal.App("poker-training-v2", image=image)
 
+
 @app.cls(
     gpu="T4",
     volumes={"/root/models": volume},
-    timeout=3600 * 4,
+    timeout=3600 * 5,
 )
 class Trainer:
     @modal.method()
@@ -27,21 +28,23 @@ class Trainer:
         sys.path.insert(0, "/root/poker")
         
         os.makedirs("/root/models", exist_ok=True)
-        poker_models = "/root/poker/models"
-        volume_models = "/root/models"
-        if os.path.exists(poker_models) and not os.path.islink(poker_models):
-            import shutil
-            shutil.rmtree(poker_models)
-        if not os.path.exists(poker_models):
-            os.symlink(volume_models, poker_models)
+        # Symlink: /root/models -> /root/poker/models (source mount)
+        # This makes relative paths like "models/rl_model.pt" resolve to the volume
+        poker_models_dir = "/root/poker/models"
+        if not os.path.islink(poker_models_dir) and not os.path.exists(poker_models_dir):
+            os.makedirs(os.path.dirname(poker_models_dir), exist_ok=True)
+        if os.path.islink(poker_models_dir):
+            os.remove(poker_models_dir)
+        if not os.path.exists(poker_models_dir):
+            os.symlink("/root/models", poker_models_dir)
         
         from training.train_rl_omc import train_rl_bot
         print(f"Starting RL training: {episodes} episodes, resume={resume}")
-        
+
         resume_path = None
         if resume:
             resume_path = os.path.join("/root/poker", resume) if not resume.startswith("/") else resume
-        
+
         train_rl_bot(
             num_episodes=episodes,
             chips_per_player=500,
@@ -49,7 +52,6 @@ class Trainer:
             lr_step_episodes=25000,
             resume_from=resume_path,
         )
-        print("Training complete!")
 
 
 if __name__ == "__main__":
