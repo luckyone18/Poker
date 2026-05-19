@@ -78,11 +78,33 @@ class RLBot:
         self.exploration_rate = exploration_rate
         self.use_fallback = use_fallback
         self.starting_chips = max(1, starting_chips)
-        self.model_loaded = False
         self.policy_net = PolicyNetwork(input_dim=26, hidden=hidden_size).to(device)
         self.value_net  = ValueNetwork(input_dim=26,  hidden=hidden_size).to(device)
         self.optimizer       = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
         self.value_optimizer = optim.Adam(self.value_net.parameters(),  lr=learning_rate)
+
+        # ── BC Reference Model (frozen) ─────────────────────────────────
+        # Load BC model as a frozen reference to constrain RL updates.
+        # KL(π_BC || π_current) penalty prevents RL from drifting away
+        # from the strong BC foundation learned via behavioral cloning.
+        self.bc_reference = PolicyNetwork(input_dim=26, hidden=hidden_size).to(device)
+        self.bc_loaded = False
+        for attempt in [model_path, "models/bc_smartbot_final.pt"]:
+            try:
+                bc_ckpt = torch.load(attempt, map_location=device)
+                if isinstance(bc_ckpt, dict) and 'policy' in bc_ckpt:
+                    self.bc_reference.load_state_dict(bc_ckpt['policy'])
+                else:
+                    self.bc_reference.load_state_dict(bc_ckpt)
+                self.bc_loaded = True
+                print(f"[BC REF] Loaded BC reference from {attempt}")
+                break
+            except Exception:
+                pass
+
+        # Freeze BC reference — no gradients, no optimizer steps
+        for p in self.bc_reference.parameters():
+            p.requires_grad = False
 
         # Episode tracking for PPO
         self.current_episode = []
@@ -507,28 +529,33 @@ class RLBot:
 
     def _ppo_update(self, episodes):
         """
-        PPO update using REWARD-TO-GO advantage (no value network).
+        PPO update with BC-constrained reward-to-go advantage.
 
-        Each step's advantage = discounted sum of future rewards from that step.
-        This avoids the value network entirely — no bootstrap error, no convergence
-        needed.  With dense per-step rewards this gives clean advantage signal.
+        Two KL penalties:
+          1. KL(old_policy || new_policy)  — PPO standard, keeps updates stable within-batch
+          2. KL(pi_BC || pi_current)       — BC constraint, keeps policy close to the frozen
+                                             behavioral-cloning reference that already plays well.
+
+        The BC KL coefficient (BC_KL_COEF) should be the dominant term.  A value of 0.5–1.0
+        means the RL update is only allowed to deviate modestly from BC; stronger adaptation
+        can be achieved by gradually annealing this coefficient over training.
 
         Args:
             episodes: list of episode buffers, each a list of step dicts
                       with keys: state, action, log_prob, reward
         """
-        GAMMA      = 0.95
-        CLIP_EPS   = 0.2
-        ENT_COEF   = 0.02
-        KL_COEF    = 0.03    # KL penalty to keep policy close to old policy
-        PPO_EPOCHS = 4
-        N_ROLLOUTS = 0       # value net disabled — using reward-to-go instead
+        GAMMA        = 0.95
+        CLIP_EPS     = 0.2
+        ENT_COEF     = 0.01   # reduced entropy — BC provides enough exploration signal
+        OLD_KL_COEF  = 0.01   # within-batch PPO KL (small, just for update stability)
+        BC_KL_COEF   = 0.80   # BC constraint — primary driver of conservative updates
+        PPO_EPOCHS   = 4
 
-        all_states       = []
-        all_actions      = []
+        all_states        = []
+        all_actions       = []
         all_old_log_probs = []
-        all_returns      = []
-        all_advantages   = []
+        all_returns       = []
+        all_advantages    = []
 
         for ep in episodes:
             # Only keep steps that received a reward assignment
@@ -539,9 +566,6 @@ class RLBot:
             rewards = [s['reward'] for s in steps]
 
             # ── Reward-to-go advantage (no value network needed) ──────────
-            # Return at step t = sum of discounted future rewards r_t + γ*r_{t+1} + ...
-            # With dense per-step rewards this is unbiased and low-variance.
-            # Advantage = Return - baseline, where baseline = mean(Returns)
             T      = len(rewards)
             returns = [0.0] * T
             gae     = 0.0
@@ -549,8 +573,6 @@ class RLBot:
                 gae     = rewards[t] + GAMMA * gae
                 returns[t] = gae
 
-            # Compute baseline = exponential moving average of returns (online)
-            # Fall back to simple mean for the first few batches
             batch_ret_mean = sum(returns) / T
             batch_ret_std  = (sum((r - batch_ret_mean) ** 2 for r in returns) / T) ** 0.5
             baseline = batch_ret_mean
@@ -570,11 +592,11 @@ class RLBot:
             return
 
         # Stack into tensors
-        states_t       = torch.cat(all_states, dim=0).to(self.device)
-        actions_t      = torch.tensor(all_actions, dtype=torch.long).to(self.device)
+        states_t        = torch.cat(all_states, dim=0).to(self.device)
+        actions_t       = torch.tensor(all_actions, dtype=torch.long).to(self.device)
         old_log_probs_t = torch.stack(all_old_log_probs).to(self.device).squeeze()
-        advantages_t   = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
-        returns_t      = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
+        advantages_t    = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
+        returns_t       = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
 
         # Normalise advantages across the whole batch (zero-mean, unit-variance)
         if advantages_t.numel() > 1 and advantages_t.std() > 1e-8:
@@ -584,26 +606,49 @@ class RLBot:
 
         for _ in range(PPO_EPOCHS):
             indices = torch.randperm(n, device=self.device)
+            idx = indices
 
-            # ── Policy loss ──────────────────────────────────────────
-            logits        = self.policy_net(states_t[indices])
-            dist          = torch.distributions.Categorical(logits=logits)
-            new_log_probs = dist.log_prob(actions_t[indices])
-            entropy       = dist.entropy().mean()
+            # ── Policy logits ────────────────────────────────────────────
+            logits         = self.policy_net(states_t[idx])
+            dist           = torch.distributions.Categorical(logits=logits)
+            new_log_probs  = dist.log_prob(actions_t[idx])
+            entropy        = dist.entropy().mean()
+            probs_current  = dist.probs                            # (B, A)
 
-            ratio  = torch.exp(new_log_probs - old_log_probs_t[indices].detach())
-            adv_b  = advantages_t[indices]
-            surr1  = ratio * adv_b
-            surr2  = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_b
-            policy_loss = -torch.min(surr1, surr2).mean() - ENT_COEF * entropy
-            # KL penalty: keep policy close to old policy (PPO standard)
-            with torch.no_grad():
-                kl_div = (torch.exp(old_log_probs_t[indices].detach())
-                           * (old_log_probs_t[indices] - new_log_probs.detach())).mean()
-            policy_loss = policy_loss + KL_COEF * kl_div
+            # ── 1. PPO clipped surrogate (against old within-batch policy)
+            ratio       = torch.exp(new_log_probs - old_log_probs_t[idx].detach())
+            adv_b       = advantages_t[idx]
+            surr1       = ratio * adv_b
+            surr2       = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_b
+            ppo_loss    = -torch.min(surr1, surr2).mean()
+
+            # ── 2. BC KL constraint  KL(pi_BC || pi_current) ─────────────
+            # Large when current policy puts mass on actions BC thinks are unlikely.
+            bc_kl_loss = torch.tensor(0.0, device=self.device)
+            if self.bc_loaded:
+                with torch.no_grad():
+                    bc_logits      = self.bc_reference(states_t[idx].detach())
+                    bc_probs       = torch.softmax(bc_logits, dim=-1).clamp(min=1e-8)
+                # KL(BC || current) = sum(BC * log(BC / current))
+                # = sum(BC * (log_B - log_C)) = -sum(BC * log_current) + H(BC)
+                bc_kl_loss = (bc_probs * (bc_probs.log() - logits.gather(
+                    dim=-1,
+                    index=actions_t[idx].unsqueeze(-1)
+                ).squeeze(-1).clamp(min=1e-8))).sum(dim=-1).mean()
+
+            # ── Combined loss ───────────────────────────────────────────
+            total_loss = (
+                ppo_loss
+                - ENT_COEF * entropy
+                + OLD_KL_COEF * ppo_loss.detach()  # small stabiliser
+                + BC_KL_COEF * bc_kl_loss           # primary BC constraint
+            )
 
             self.optimizer.zero_grad()
-            policy_loss.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
             self.optimizer.step()
-            # Value network frozen — not used for advantage estimation
+
+            if _ == 0 and self.bc_loaded:
+                print(f"  [PPO] ppo_loss={ppo_loss.item():+.4f}  bc_kl={bc_kl_loss.item():.4f}  "
+                      f"ent={entropy.item():.4f}  adv_mean={adv_b.mean().item():+.4f}", flush=True)
