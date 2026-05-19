@@ -450,17 +450,10 @@ class RLBot:
     
     def record_reward(self, reward):
         """
-        Compute per-round chip delta rewards for steps in the current hand.
-
-        Per-round shaping: at each step, the immediate reward is the change in
-        the hero's chip investment since the last step.
-          - Hero puts more chips in  → negative reward (cost of betting/calling)
-          - Hero wins chips back     → positive reward (chip gain from pot)
-        At the terminal step (showdown), the net chip delta is added.
-
-        The value network is BYPASSED — we use Monte-Carlo advantage estimation
-        with N rollouts per state.  With dense per-step rewards the value net
-        is unnecessary and its random initialisation corrupts GAE.
+        Simple reward assignment: full reward distributed equally across all
+        steps.  This produces reward-to-go where the advantage of each step
+        is its proportional share of the terminal chip delta — the same
+        signal that worked well before, now combined with BC KL penalty.
         """
         if not self.training_mode or not self.current_episode:
             return
@@ -469,27 +462,9 @@ class RLBot:
         if not steps:
             return
 
-        scale = max(self.starting_chips, 1)
-
-        # Pass 1: compute per-step chip-delta rewards
-        # Immediate reward = change in total chips since last step.
-        # Hero loses chips  → negative reward (cost of bet/call)
-        # Hero wins pot     → positive reward (chip gain)
-        prev_chips = float(steps[0].get('chips', 0))
-        net_delta  = 0.0   # cumulative net chip change this hand
-
         for step in steps:
-            curr_chips = float(step.get('chips', 0))
-            delta = (curr_chips - prev_chips) / scale
-            step['reward'] = delta
-            net_delta += delta
-            prev_chips = curr_chips
+            step['reward'] = reward / len(steps)
 
-        # Terminal step: add net chip delta + bonus
-        terminal_bonus = net_delta + reward
-        steps[-1]['reward'] = steps[-1].get('reward', 0) + terminal_bonus
-
-        # Advance so next hand's reward won't overwrite these
         self._hand_step_start = len(self.current_episode)
         self.episode_rewards.append(reward)
     
@@ -544,11 +519,12 @@ class RLBot:
             episodes: list of episode buffers, each a list of step dicts
                       with keys: state, action, log_prob, reward
         """
-        GAMMA        = 0.95
-        CLIP_EPS     = 0.2
-        ENT_COEF     = 0.01   # reduced entropy — BC provides enough exploration signal
-        BC_KL_COEF   = 0.80   # BC constraint — primary driver of conservative updates
-        PPO_EPOCHS   = 4
+        GAMMA        = 0.99       # higher gamma for more forward-looking rewards
+        CLIP_EPS     = 0.1        # tighter clip for more conservative updates
+        ENT_COEF     = 0.005      # very low entropy — BC provides the diversity signal
+        BC_KL_COEF   = 1.00       # strong BC constraint — don't deviate from BC baseline
+        PPO_EPOCHS   = 3         # fewer epochs per batch to reduce update magnitude
+        BATCH_SIZE   = 64         # larger batches = less noisy advantages
 
         all_states        = []
         all_actions       = []
