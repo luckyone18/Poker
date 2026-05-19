@@ -620,19 +620,24 @@ class RLBot:
             surr2       = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_b
             ppo_loss    = -torch.min(surr1, surr2).mean()
 
-            # ── 2. BC KL constraint  KL(pi_BC || pi_current) ─────────────
-            # Large when current policy puts mass on actions BC thinks are unlikely.
+            # ── 2. BC KL constraint  KL(pi_BC || pi_current) ─────────────────
+            # Penalises current policy when it diverges from the frozen BC reference.
+            # KL(BC || current) = sum_a P_BC(a) * log(P_BC(a) / P_current(a))
+            #                   = H(BC, BC) - H(BC, current)
+            #                   = -sum_a P_BC(a) * log_P_current(a) + H(BC)
+            # All via categorical log_probs (no gather needed).
             bc_kl_loss = torch.tensor(0.0, device=self.device)
             if self.bc_loaded:
                 with torch.no_grad():
-                    bc_logits      = self.bc_reference(states_t[idx].detach())
-                    bc_probs       = torch.softmax(bc_logits, dim=-1).clamp(min=1e-8)
-                # KL(BC || current) = sum(BC * log(BC / current))
-                # = sum(BC * (log_B - log_C)) = -sum(BC * log_current) + H(BC)
-                bc_kl_loss = (bc_probs * (bc_probs.log() - logits.gather(
-                    dim=-1,
-                    index=actions_t[idx].unsqueeze(-1)
-                ).squeeze(-1).clamp(min=1e-8))).sum(dim=-1).mean()
+                    bc_logits = self.bc_reference(states_t[idx])       # (B, A)
+                    bc_probs  = torch.softmax(bc_logits, dim=-1).clamp(min=1e-8)
+                current_logits = logits                                   # (B, A)
+                # KL(BC || current) = sum_a P_BC(a) * [log_PBC(a) - log_Pcurrent(a)]
+                # Categorical cross-entropy of BC probs against current logits:
+                cross_ent = -(bc_probs * current_logits.log_softmax(dim=-1)).sum(dim=-1)
+                # Entropy of BC (constant, no gradient needed — but keep for KL magnitude)
+                bc_ent   = -(bc_probs * bc_probs.log()).sum(dim=-1)
+                bc_kl_loss = cross_ent.mean()   # positive = current deviates from BC
 
             # ── Combined loss ───────────────────────────────────────────
             total_loss = (
@@ -647,5 +652,5 @@ class RLBot:
             self.optimizer.step()
 
             if _ == 0 and self.bc_loaded:
-                print(f"  [PPO] ppo_loss={ppo_loss.item():+.4f}  bc_kl={bc_kl_loss.item():.4f}  "
-                      f"ent={entropy.item():.4f}  adv_mean={adv_b.mean().item():+.4f}", flush=True)
+                print(f"  [PPO] ppo_loss={ppo_loss.item():+.4f}  bc_kl={bc_kl_loss.item():.4f}  " \
+                      f"ent={entropy.item():.4f}  adv={adv_b.mean().item():+.4f}", flush=True)
