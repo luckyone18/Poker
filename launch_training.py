@@ -24,11 +24,24 @@ app = modal.App("poker-training-v2", image=image)
 class Trainer:
     @modal.method()
     def train(self, episodes: int = 5000, resume: str = None):
-        import os, sys
+        import os, sys, subprocess
+
+        # Clone the full poker repo into /root/poker so all submodules resolve
+        if not os.path.isdir("/root/poker"):
+            print("Cloning poker repo...")
+            result = subprocess.run(
+                ["git", "clone", "https://github.com/luckyone18/Poker.git", "/root/poker"],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"git clone failed:\n{result.stderr}")
+            print(f"Repo cloned.\n{result.stdout}")
+
         sys.path.insert(0, "/root/poker")
-        
+        os.chdir("/root/poker")
+
         os.makedirs("/root/models", exist_ok=True)
-        # Symlink: /root/models -> /root/poker/models (source mount)
+        # Symlink: /root/models -> /root/poker/models (volume)
         # This makes relative paths like "models/rl_model.pt" resolve to the volume
         poker_models_dir = "/root/poker/models"
         if not os.path.islink(poker_models_dir) and not os.path.exists(poker_models_dir):
@@ -37,13 +50,15 @@ class Trainer:
             os.remove(poker_models_dir)
         if not os.path.exists(poker_models_dir):
             os.symlink("/root/models", poker_models_dir)
-        
+        print(f"/root/poker/models symlink: {os.path.islink(poker_models_dir)}")
+
         from training.train_rl_omc import train_rl_bot
         print(f"Starting RL training: {episodes} episodes, resume={resume}")
 
         resume_path = None
         if resume:
             resume_path = os.path.join("/root/poker", resume) if not resume.startswith("/") else resume
+            print(f"Resume path: {resume_path} (exists={os.path.exists(resume_path)})")
 
         train_rl_bot(
             num_episodes=episodes,
@@ -63,12 +78,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     print(f"Launching training: {args.episodes} episodes, resume={args.resume}")
-    # Clone the poker repo into the container
-    import subprocess
-    subprocess.run(
-        ["git", "clone", "https://github.com/luckyone18/Poker.git", "/root/poker"],
-        check=True, capture_output=True
-    )
     with app.run():
         Trainer().train.remote(args.episodes, args.resume)
         print("Done!")
